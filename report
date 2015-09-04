@@ -1,0 +1,337 @@
+---
+title: "A Model for Payment Center"
+output: html_document
+---
+
+
+```{r globalsettings,echo=F,message=F}
+
+#Load packages
+library(knitr)
+library(grid)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(caTools)
+library(miscTools)
+library(ROCR)
+
+#Set global chunk options
+opts_chunk$set(echo=F,cache=T,message=F)
+```
+```{r}
+
+#Read datasets
+details<-read.csv("CBdetails_201406-201502.csv")
+cb<-read.csv("chargeback_201406-201502.csv")
+nor<-read.csv("normal_201406-201502.csv")
+```
+##Chargeback snapshot 
+
+Data Range: 201406-201502
+
+
+*Count of chargeback and normal orders
+```{r}
+
+#Add a column to label order types
+cb$type<-"chargeback"
+nor$type<-"normal"
+
+#Union chargeback and normal orders
+all<-rbind(cb,nor)
+
+#Remove duplicate orders
+all<-all[!duplicated(all$OrderID),]
+
+#Count of 2 types in each gateway
+table(all$GatewayCode,all$type)
+
+totalrate<-paste(round(n_distinct(cb$OrderID)/(n_distinct(cb$OrderID)+n_distinct(nor$OrderID))*100,2), "%", sep='')
+
+#Count of chargeback cases in each gateway and result
+table(details$PayMethodName,details$Result)
+
+loserate<-paste(round(nrow(details[details$Result=="Lose",])/nrow(all)*100,2), "%", sep='')
+```
+
+
+Total chargeback rate is around `r totalrate`, with the loss rate of `r loserate`.
+
+
+
+*Count of review status in chargeback cases 
+
+```{r review}
+table(details$Manual.review)
+fpr<-paste(round(nrow(details[details$Manual.review=="Yes",])/nrow(details)*100,2), "%", sep='')
+
+```
+
+The problem is obvious, only `r fpr` of the chargeback cases has entered manual review where we would make verification.
+
+
+So what's wrong with our system?
+
+##Current rule settings
+
+Below is a comparision of the rule trigger frequency in each chargeback and normal order by gateway.
+
+The expectation for negative rules is that they should trigger more often in chargeback than normal ones so potential fraud orders are more likely to enter manual review. (if final score is negative) 
+
+For positive rules, they should trigger more in normal than in chargeback so low risk orders are more likely to be passed by system.
+
+
+```{r rules}
+
+#Group datasets by gateway and rule id
+cbrule<-aggregate(OrderID~Code+GatewayCode,cb,n_distinct)
+norrule<-aggregate(OrderID~Code+GatewayCode,nor,n_distinct)
+cbrule$type<-"chargeback"
+norrule$type<-"normal"
+sample<-rbind(cbrule,norrule)
+
+#Add column with total order counts in each gateway and type
+sample$Score<-c(rep.int(250,12),rep.int(2238,27),rep.int(202,20),rep.int(446,17),rep.int(1926,18),rep.int(146414,31),rep.int(31772,25),rep.int(29491,20))
+
+#Add column to calculate rule trigger rate
+sample$Rate<-sample$OrderID/sample$Score
+
+#Label rule types
+for (i in 1:170){
+        if (sample$Code[i]=="204"||sample$Code[i]=="102"||sample$Code[i]=="401Partial"||sample$Code[i]=="411Partial"||sample$Code[i]=="501"||sample$Code[i]=="502"||sample$Code[i]=="503"||sample$Code[i]=="504"||sample$Code[i]=="505"||sample$Code[i]=="601"||sample$Code[i]=="602")
+                sample$Ruletype[i]<-"Positive"
+        else sample$Ruletype[i]<-"Negative"
+}
+
+#Delete rows of ruleScore
+sample<-filter(sample,Code!="Score")
+
+```
+
+```{r plot,fig.height=80,fig.width=55}
+
+#Make a barplot of rule trigger rate in different order types by gateway & rule type
+g<-ggplot(sample,aes(Code,Rate,fill=factor(type)))+geom_bar(stat="identity",position='dodge')+facet_wrap(GatewayCode~Ruletype,ncol=2,scales="free")+theme(title=element_text(size=50,colour = "black",face="bold"),legend.text=element_text(size=45,colour = "black"),axis.text.x=element_text(size=35,colour = "black",face="bold"),axis.text.y=element_text(size=25,colour = "black"),strip.text=element_text(size=35,colour = "black"),panel.margin=unit(1,"lines"))
+g
+
+```
+
+With this figure, we could get a rough idea about the rules' efficiency and try to make some adjustment, such as increase weight of some negative rules by specific gateway and score: 
+
+201 (7days threshold) in Paypal and Payprin
+
+302 (risky game--Runescape old school) in all gateways;
+
+408 (risky member) in Payprin; 
+
+409 (1st purchase) in Skrill;
+
+And, remove 501 who has great errors (501 means member has passed our phone verification and gets 5 points, which is a high positive score in our platform.) It shows the phone verification couldn't ensure that member won't file chargeback in his next order. Thus, none of the gateway accepts phone record as an evidence.
+
+Also, 401 Partial & 411 Partial (PayPal verified account and avs confirmed) triggers equally likely in both types, which means the high quality Paypal account doesn't reduce the possibility of filing chargeback. 
+
+But how do we modify the score with least errors?
+
+##Improve the system with Model
+
+All rules are created upon the patterns we found, it exists some unknown pattern which may imply the potential fraud, but it's more time consuming and difficult to define with low errors. So currently, we'd better focus on how to utilize our built-in rules at maxmum.
+
+```{r recentpaypaldata}
+
+#Choose paypal orders and reshape the data.frame to order as observation, rule id and order type as variable 
+pplcb<-droplevels(subset(cb,GatewayCode=="PayPal"))
+pplcbrule<-as.data.frame(table(pplcb$OrderID,pplcb$Code))
+pcbrule<-reshape(pplcbrule,idvar="Var1",timevar="Var2",direction="wide")
+pcbrule$chargeback<-1
+pplnor<-droplevels(subset(nor,GatewayCode=="PayPal"))
+pplnorrule<-as.data.frame(table(pplnor$OrderID,pplnor$Code))
+pnorrule<-reshape(pplnorrule,idvar="Var1",timevar="Var2",direction="wide")
+pnorrule$chargeback<-0
+
+#Add rule ids to chargeback data.frame so that it has same columns as the normal one 
+pcbrule<-as.matrix(pcbrule)
+pcbrule<-insertCol(pcbrule,24,v=0,cName="Freq.504")
+pcbrule<-insertCol(pcbrule,28,v=0,cName="Freq.701")
+pcbrule<-insertCol(pcbrule,29,v=0,cName="Freq.702")
+pcbrule<-insertCol(pcbrule,30,v=0,cName="Freq.801")
+pcbrule<-as.data.frame(pcbrule)
+pcbrule[sapply(pcbrule, is.factor)] <- lapply(pcbrule[sapply(pcbrule, is.factor)], as.character)
+prules<-rbind(pcbrule,pnorrule)
+
+#Remove duplicate orders and select those created from Nov. 2014
+pdata<-filter(prules,Freq.Score!="2")
+recent<-filter(pdata,Var1>1388543)
+```
+<br>
+
+####Current formula of final score:
+
+f= β1+ β2 + β3 + β4 + β5...
+
+β - triggered rule score
+
+
+<br>
+If f < 0, order will enter manual review
+
+<br>
+
+####Model: 
+
+The idea is, any order has a final score greater than threshold, it's a potential fraud case and will enter manual review.
+
+<br>
+
+####Basic logistic formula:
+
+f(x)= 1/(1+e^s)
+
+s= -(β0+β1x1+ β2x2 + β3x3 + β4x4 + β5x5...)
+
+<br>
+e - mathematical constant
+
+β0 - Intercept
+
+β - rule score
+
+x - rule, 1 if triggered, 0 if not.
+
+<br>
+If f(x) > threshold, the order should enter manual review.
+
+<br>
+
+####Attempt on Paypal: 
+
+Build a logistic regression model to find the best rule coefficients (i.e. score) with the PayPal data from Nov.2014 where the rule settings has not changed then on.
+
+
+Below is a model with all rules as variable, we can see some rules don't imply chargeback significantly.(less than 3 *)
+
+*The column Estimate represents the closest score for every rule estimated upon the data.
+
+```{r paypallog}
+
+#set seed and split the sample into Train and Test set with baseline accurancy
+recent[sapply(recent, is.character)] <- lapply(recent[sapply(recent, is.character)], as.integer)
+set.seed(88)
+split<-sample.split(recent$chargeback, SplitRatio = 0.983)
+pTrain<-subset(recent, split == TRUE)
+pTest<-subset(recent, split == FALSE)
+
+#Inspect the model with all rules
+paypalLog<-glm(chargeback ~ Freq.102+Freq.201+Freq.202+Freq.203+Freq.204+Freq.301+Freq.302+Freq.401+Freq.401Partial+Freq.403+Freq.404+Freq.405+Freq.407+Freq.408+Freq.409+Freq.411+Freq.411Partial+Freq.417+Freq.418+Freq.501+Freq.502+Freq.503+Freq.504+Freq.505+Freq.601+Freq.602+Freq.701+Freq.702+Freq.801+Freq.IOVation,data=pTrain, family=binomial,control = list(maxit = 100000))
+summary(paypalLog)
+
+```
+*Negative coefficient: this rule predicts normal cases
+
+ Positive coefficient: this rule predicts chargeback cases
+
+
+
+After some test, we could keep following rules which are most significant and have the same direction of coefficient as the figure. 
+
+For the rules not in the formula, it will still trigger in the system but with score 0, so it won't impact the final score but work as a reference for the reviewer to decide the verification type.
+
+
+```{r}
+#This one has relatively low AIC and correct rule expectation
+
+#405, 417, 418 shouldn't have a negative coefficient which is against intuition and the figure, also not manage to find a correlation with other rules so I delete them from the model, anyway they are not significant on the figure
+paypalbest<-glm(chargeback ~ Freq.102+Freq.201+Freq.202+Freq.203+Freq.204+Freq.302+Freq.401+Freq.403+Freq.404+Freq.408+Freq.411+Freq.601+Freq.602+Freq.IOVation,data=pTrain, family=binomial)
+summary(paypalbest)
+
+```
+
+
+##Predict Result with model: 
+
+<br>
+
+####Decide threshold
+
+The figure below shows the prediction result from this model.
+
+point on the line stands for threshold<br>
+x-axis, approximately equal to manual review rate<br>
+y-axis, % of risky orders entering MR<br>
+ 
+
+
+```{r}
+
+#Plot ROC curve with threshold labels to decide threshold
+predictTrain<-predict(paypalbest, type="response")
+ROCRpred<-prediction(predictTrain, pTrain$chargeback)
+ROCRperf<-performance(ROCRpred, "tpr", "fpr")
+
+plot(ROCRperf, colorize=TRUE, print.cutoffs.at=seq(0,0.06,by=0.01), text.adj=c(-0.2,1.7),main="ROC curve with threshold labels")
+
+```
+
+If choose to keep current MR (x ≈ 0.2), we could get a more accurate prediction, aka. y ≈ 0.45. (threshold ≈ 0.025)<br>
+If choose to maintain y ≈ 0.2 (current percentage of risky orders entering MR), we would reduce the MR to 0.02 only. Which means, at current Chargeback Rate, we only need to make 2% manual review actually. (threshold ≈ 0.05; although it is a little extreme, we could still find how inefficient the current system is. ).
+
+
+
+
+```{r test,results='hide'}
+#Outcome on Testset, same as Trainset, model complete
+predictTest<-predict(paypalbest,newdata=pTest,type="response")
+table(pTest$chargeback,predictTest>0.03)
+
+```
+
+####Result table:
+
+The rows are labeled with the actual outcome, and the columns are labeled with the predicted outcome. Each entry of the table gives the number of data observations that fall into that category. So the number of true negatives is the number of observations that are actually normal case and for which we predict normal. 
+The false negatives are the number of cases for which we predict normal, but they're actually chargeback, vice versa.
+
+
+The threshold without changing manual review rate is around 0.02 to 0.03.
+
+Current true positive rate (i.e. % of risky orders entering MR) is only 19.91%.
+<br>
+<br>
+Predict result at 0.02
+
+manual review rate = (592+15537)/71061= 22.7%
+
+true positive rate = 592/(592+615) = 49%<br>
+
+```{r}
+table(pTrain$chargeback, predictTrain > 0.02)
+```
+
+<br>
+Predict result at 0.03
+
+manual review rate = (512+11054)/71061= 16.28%
+
+true positive rate = 512/(512+695) = 42.4%
+
+```{r}
+table(pTrain$chargeback, predictTrain > 0.03)
+```
+
+
+<br>
+<br>
+
+##Summary
+
+I suggest to choose the threshold at 0.03 which will both reduce our manual review rate and increase more than twice as much its accurancy.
+
+We would predict 42.4% (cur. 19.91%) true potential fraud cases at PayPal. 
+
+Reduce the manual review rate to 16.28% (cur. 22.3%).
+
+And upon right verification, the CB rate could be cut down to under 1% (cur. 1.53%).
+<br>
+<br>
+
+####With this model, we could control all these rates by adjusting threshold, weigh rule scores quickly when there's a new one and test any potential pattern's efficiency.
